@@ -22,17 +22,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  update:
-    name: Update orka formula
-    # The job commits to main, so only run it from main.
+  # Installing and testing the formula runs the downloaded release binary, so
+  # this job gets a read-only token and no persisted Git credentials.
+  test:
+    name: Generate and test orka formula
+    # The commit job pushes to main, so only run from main.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    permissions:
-      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -73,10 +77,32 @@ jobs:
           brew install orka-agents/tap/orka
           brew test orka-agents/tap/orka
 
-      - name: Commit formula
-        if: steps.version.outputs.value
+  # Regenerates the same bytes from the signed checksums on a fresh runner and
+  # never executes the release binary.
+  commit:
+    name: Commit orka formula
+    needs: test
+    if: needs.test.outputs.version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Generate formula
         env:
-          VERSION: ${{ steps.version.outputs.value }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.test.outputs.version }}
+        run: scripts/update-formula.sh "${VERSION}"
+
+      - name: Commit formula
+        env:
+          VERSION: ${{ needs.test.outputs.version }}
         run: |
           set -euo pipefail
           git add Formula/orka.rb
