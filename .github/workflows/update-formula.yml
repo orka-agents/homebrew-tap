@@ -1,0 +1,116 @@
+name: Update formula
+
+# Orka's release workflow sends `orka-release` after it publishes a stable
+# release. The schedule catches a release whose dispatch was missed.
+on:
+  repository_dispatch:
+    types: [orka-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Orka release tag, such as v0.3.0 (defaults to the latest release)
+        required: false
+        type: string
+  schedule:
+    - cron: '17 */6 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-formula
+  cancel-in-progress: false
+
+jobs:
+  # Installing and testing the formula runs the downloaded release binary, so
+  # this job gets a read-only token and no persisted Git credentials.
+  test:
+    name: Generate and test orka formula
+    # The commit job pushes to main, so only run from main.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Resolve version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ github.event.client_payload.version || inputs.version }}
+        run: |
+          set -euo pipefail
+          version=${REQUESTED:-$(gh release view --repo orka-agents/orka --json tagName --jq .tagName)}
+          current=$(sed -n 's|.*/releases/download/\(v[^/]*\)/.*|\1|p' Formula/orka.rb 2>/dev/null | head -n1 || true)
+          if [[ -n "${current}" && "$(printf '%s\n%s\n' "${current}" "${version}" | sort -V | tail -n1)" == "${current}" ]]; then
+            echo "Formula is at ${current}; ${version} is not newer."
+            exit 0
+          fi
+          echo "value=${version}" >>"${GITHUB_OUTPUT}"
+
+      - name: Generate formula
+        if: steps.version.outputs.value
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: scripts/update-formula.sh "${VERSION}"
+
+      - name: Install and test formula
+        if: steps.version.outputs.value
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: |
+          set -euo pipefail
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          tap="$(brew --repository)/Library/Taps/orka-agents/homebrew-tap"
+          mkdir -p "$(dirname "${tap}")"
+          ln -s "${GITHUB_WORKSPACE}" "${tap}"
+          brew style orka-agents/tap/orka
+          brew install orka-agents/tap/orka
+          brew test orka-agents/tap/orka
+
+  # Regenerates the same bytes from the signed checksums on a fresh runner and
+  # never executes the release binary.
+  commit:
+    name: Commit orka formula
+    needs: test
+    if: needs.test.outputs.version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Generate formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.test.outputs.version }}
+        run: scripts/update-formula.sh "${VERSION}"
+
+      - name: Commit formula
+        env:
+          VERSION: ${{ needs.test.outputs.version }}
+        run: |
+          set -euo pipefail
+          git add Formula/orka.rb
+          if git diff --cached --quiet; then
+            echo "Formula already matches ${VERSION}."
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -s -m "orka ${VERSION#v}"
+          git push origin HEAD:main
